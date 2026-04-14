@@ -1,6 +1,7 @@
 # Environment files
 **/.env
 **/.env.*
+**/.envrc
 
 # Virtual environments
 **/venv/
