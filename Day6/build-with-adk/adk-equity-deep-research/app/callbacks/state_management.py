@@ -1,0 +1,79 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""State management callbacks for query classification and session state."""
+
+
+async def initialize_charts_state_callback(callback_context):
+    """Initialize/reset charts state for new query.
+
+    Always resets state since FOLLOW_UP queries are no longer supported.
+    This ensures the template variables exist in state before the chart/infographic
+    generation starts.
+    """
+    print("\n" + "="*80)
+    print("INITIALIZE CHARTS STATE CALLBACK - START")
+    print("="*80)
+
+    state = callback_context.state
+
+    print(f"📋 Agent: {callback_context.agent_name}")
+    print(f"🔑 Invocation ID: {callback_context.invocation_id}")
+
+    # Always reset visualization state for fresh analysis
+    # (FOLLOW_UP queries are rejected before reaching this point)
+    print("\n🔄 Resetting visualization state for new analysis...")
+
+    state["charts_generated"] = []
+    state["charts_summary"] = []
+    state["infographics_summary"] = []
+
+    print("✓ State reset complete")
+    print("="*80 + "\n")
+
+
+async def ensure_classifier_state_callback(callback_context):
+    """Ensure required state variables exist before agents run.
+
+    On the first query in a session, certain state variables won't exist yet
+    and template variable injection will fail with KeyError. Initialize with
+    default values if missing.
+
+    Also resets turn-based flags for HITL flow control.
+    """
+    state = callback_context.state
+
+    # Initialize query classifier state
+    if "last_query_summary" not in state:
+        state["last_query_summary"] = "No previous query context (first query in session)"
+        print("✓ Initialized last_query_summary for first query in session")
+
+    # Initialize HITL planning state (Phase 2)
+    if "plan_state" not in state:
+        state["plan_state"] = "none"
+        print("✓ Initialized plan_state to 'none'")
+
+    # CRITICAL: Reset turn-based flags at the start of each turn
+    # This ensures that after a plan is presented or rejection shown,
+    # subsequent agents in the SAME turn skip, but on the NEXT turn they can run.
+    if state.get("plan_presented_this_turn"):
+        state["plan_presented_this_turn"] = False
+        print("✓ Reset plan_presented_this_turn flag for new turn")
+
+    # Reset skip_pipeline flag for new turn
+    # This allows the next query to be processed fresh
+    if state.get("skip_pipeline"):
+        state["skip_pipeline"] = False
+        state["pipeline_response"] = None
+        print("✓ Reset skip_pipeline flag for new turn")

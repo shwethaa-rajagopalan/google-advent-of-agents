@@ -1,0 +1,464 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hub
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"strings"
+	"sync"
+
+	"github.com/GoogleCloudPlatform/scion/pkg/store"
+)
+
+// EventPublisher defines the interface for publishing Hub events.
+// Implementations fan out events to subscribers by subject pattern.
+type EventPublisher interface {
+	PublishAgentStatus(ctx context.Context, agent *store.Agent)
+	PublishAgentCreated(ctx context.Context, agent *store.Agent)
+	PublishAgentDeleted(ctx context.Context, agentID, groveID string)
+	PublishGroveCreated(ctx context.Context, grove *store.Grove)
+	PublishGroveUpdated(ctx context.Context, grove *store.Grove)
+	PublishGroveDeleted(ctx context.Context, groveID string)
+	PublishBrokerConnected(ctx context.Context, brokerID, brokerName string, groveIDs []string)
+	PublishBrokerDisconnected(ctx context.Context, brokerID string, groveIDs []string)
+	PublishBrokerStatus(ctx context.Context, brokerID, status string)
+	PublishNotification(ctx context.Context, notif *store.Notification)
+	PublishUserMessage(ctx context.Context, msg *store.Message)
+	Close()
+}
+
+// noopEventPublisher is a zero-value EventPublisher where all methods are no-ops.
+// The Server initializes events to this so handlers never need nil checks.
+type noopEventPublisher struct{}
+
+func (noopEventPublisher) PublishAgentStatus(_ context.Context, _ *store.Agent)              {}
+func (noopEventPublisher) PublishAgentCreated(_ context.Context, _ *store.Agent)             {}
+func (noopEventPublisher) PublishAgentDeleted(_ context.Context, _, _ string)                {}
+func (noopEventPublisher) PublishGroveCreated(_ context.Context, _ *store.Grove)             {}
+func (noopEventPublisher) PublishGroveUpdated(_ context.Context, _ *store.Grove)             {}
+func (noopEventPublisher) PublishGroveDeleted(_ context.Context, _ string)                   {}
+func (noopEventPublisher) PublishBrokerConnected(_ context.Context, _, _ string, _ []string) {}
+func (noopEventPublisher) PublishBrokerDisconnected(_ context.Context, _ string, _ []string) {}
+func (noopEventPublisher) PublishBrokerStatus(_ context.Context, _, _ string)                {}
+func (noopEventPublisher) PublishNotification(_ context.Context, _ *store.Notification)      {}
+func (noopEventPublisher) PublishUserMessage(_ context.Context, _ *store.Message)            {}
+func (noopEventPublisher) Close()                                                            {}
+
+// Event is a published event with a subject and JSON-encoded data.
+type Event struct {
+	Subject string
+	Data    []byte
+}
+
+// AgentDetail provides freeform context about the current activity in SSE events.
+type AgentDetail struct {
+	ToolName    string `json:"toolName,omitempty"`
+	Message     string `json:"message,omitempty"`
+	TaskSummary string `json:"taskSummary,omitempty"`
+
+	// Limits tracking — included so the frontend can update counters in real-time.
+	CurrentTurns      int    `json:"currentTurns,omitempty"`
+	CurrentModelCalls int    `json:"currentModelCalls,omitempty"`
+	StartedAt         string `json:"startedAt,omitempty"`
+}
+
+// AgentStatusEvent is published when an agent's status changes.
+type AgentStatusEvent struct {
+	AgentID         string       `json:"agentId"`
+	GroveID         string       `json:"groveId"`
+	Phase           string       `json:"phase,omitempty"`
+	Activity        string       `json:"activity,omitempty"`
+	Detail          *AgentDetail `json:"detail,omitempty"`
+	ContainerStatus string       `json:"containerStatus,omitempty"`
+}
+
+// AgentCreatedEvent is published when an agent is created.
+// Unlike status deltas this carries the full agent snapshot so that
+// subscribers can render a complete row without an extra REST fetch.
+type AgentCreatedEvent struct {
+	AgentID         string `json:"agentId"`
+	GroveID         string `json:"groveId"`
+	Name            string `json:"name"`
+	Slug            string `json:"slug"`
+	Template        string `json:"template,omitempty"`
+	Phase           string `json:"phase,omitempty"`
+	Activity        string `json:"activity,omitempty"`
+	ContainerStatus string `json:"containerStatus,omitempty"`
+	Image           string `json:"image,omitempty"`
+	Runtime         string `json:"runtime,omitempty"`
+	RuntimeBrokerID string `json:"runtimeBrokerId,omitempty"`
+	CreatedBy       string `json:"createdBy,omitempty"`
+	Visibility      string `json:"visibility,omitempty"`
+	TaskSummary     string `json:"taskSummary,omitempty"`
+	Created         string `json:"created,omitempty"`
+}
+
+// AgentDeletedEvent is published when an agent is deleted.
+type AgentDeletedEvent struct {
+	AgentID string `json:"agentId"`
+	GroveID string `json:"groveId"`
+}
+
+// GroveCreatedEvent is published when a grove is created.
+type GroveCreatedEvent struct {
+	GroveID string `json:"groveId"`
+	Name    string `json:"name"`
+	Slug    string `json:"slug"`
+}
+
+// GroveUpdatedEvent is published when a grove is updated.
+type GroveUpdatedEvent struct {
+	GroveID string `json:"groveId"`
+	Name    string `json:"name"`
+}
+
+// GroveDeletedEvent is published when a grove is deleted.
+type GroveDeletedEvent struct {
+	GroveID string `json:"groveId"`
+}
+
+// BrokerGroveEvent is published when a broker connects or disconnects,
+// with one event per grove the broker serves.
+type BrokerGroveEvent struct {
+	BrokerID   string `json:"brokerId"`
+	BrokerName string `json:"brokerName,omitempty"`
+	GroveID    string `json:"groveId"`
+	Status     string `json:"status"` // "online" or "offline"
+}
+
+// BrokerStatusEvent is published for general broker status changes.
+type BrokerStatusEvent struct {
+	BrokerID string `json:"brokerId"`
+	Status   string `json:"status"`
+}
+
+// UserMessageEvent is published when an agent sends a message to a human inbox.
+type UserMessageEvent struct {
+	ID          string `json:"id"`
+	GroveID     string `json:"groveId"`
+	Sender      string `json:"sender"`
+	SenderID    string `json:"senderId"`
+	Recipient   string `json:"recipient"`
+	RecipientID string `json:"recipientId"`
+	Msg         string `json:"msg"`
+	Type        string `json:"type"`
+	Urgent      bool   `json:"urgent,omitempty"`
+	AgentID     string `json:"agentId"`
+	CreatedAt   string `json:"createdAt"`
+}
+
+// NotificationCreatedEvent is published when a user notification is created.
+type NotificationCreatedEvent struct {
+	ID        string `json:"id"`
+	AgentID   string `json:"agentId"`
+	GroveID   string `json:"groveId"`
+	Status    string `json:"status"`
+	Message   string `json:"message"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// ChannelEventPublisher is an in-process event publisher that fans out events
+// to Go channel subscribers using NATS-style subject matching.
+type ChannelEventPublisher struct {
+	mu          sync.RWMutex
+	subscribers map[string][]chan Event
+	closed      bool
+}
+
+// NewChannelEventPublisher creates a new ChannelEventPublisher.
+func NewChannelEventPublisher() *ChannelEventPublisher {
+	return &ChannelEventPublisher{
+		subscribers: make(map[string][]chan Event),
+	}
+}
+
+// Subscribe returns a channel that receives events matching the given patterns,
+// and an unsubscribe function. The channel is buffered with capacity 64.
+// Patterns use NATS-style wildcards: * matches a single token, > matches the remainder.
+func (p *ChannelEventPublisher) Subscribe(patterns ...string) (<-chan Event, func()) {
+	ch := make(chan Event, 64)
+
+	p.mu.Lock()
+	for _, pattern := range patterns {
+		p.subscribers[pattern] = append(p.subscribers[pattern], ch)
+	}
+	p.mu.Unlock()
+
+	unsubscribe := func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for _, pattern := range patterns {
+			subs := p.subscribers[pattern]
+			for i, s := range subs {
+				if s == ch {
+					p.subscribers[pattern] = append(subs[:i], subs[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	return ch, unsubscribe
+}
+
+// publish marshals the event to JSON and fans out to matching subscribers.
+// Sends are non-blocking: events are dropped if a subscriber's buffer is full.
+func (p *ChannelEventPublisher) publish(subject string, event interface{}) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		slog.Error("Failed to marshal event", "subject", subject, "error", err)
+		return
+	}
+
+	evt := Event{Subject: subject, Data: data}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.closed {
+		return
+	}
+
+	for pattern, subs := range p.subscribers {
+		if subjectMatchesPattern(pattern, subject) {
+			for _, ch := range subs {
+				select {
+				case ch <- evt:
+				default:
+					// Drop event on full buffer (backpressure)
+				}
+			}
+		}
+	}
+}
+
+// Close marks the publisher as closed and closes all subscriber channels.
+func (p *ChannelEventPublisher) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return
+	}
+	p.closed = true
+
+	// Close all unique subscriber channels
+	seen := make(map[chan Event]bool)
+	for _, subs := range p.subscribers {
+		for _, ch := range subs {
+			if !seen[ch] {
+				close(ch)
+				seen[ch] = true
+			}
+		}
+	}
+}
+
+// PublishAgentStatus publishes an agent status event to both agent-specific
+// and grove-scoped subjects (dual-publish pattern).
+func (p *ChannelEventPublisher) PublishAgentStatus(_ context.Context, agent *store.Agent) {
+	evt := AgentStatusEvent{
+		AgentID:         agent.ID,
+		GroveID:         agent.GroveID,
+		Phase:           agent.Phase,
+		Activity:        agent.Activity,
+		ContainerStatus: agent.ContainerStatus,
+	}
+
+	detail := AgentDetail{
+		ToolName:          agent.ToolName,
+		Message:           agent.Message,
+		TaskSummary:       agent.TaskSummary,
+		CurrentTurns:      agent.CurrentTurns,
+		CurrentModelCalls: agent.CurrentModelCalls,
+	}
+	if !agent.StartedAt.IsZero() {
+		detail.StartedAt = agent.StartedAt.Format("2006-01-02T15:04:05Z07:00")
+	}
+	if detail != (AgentDetail{}) {
+		evt.Detail = &detail
+	}
+	p.publish("agent."+agent.ID+".status", evt)
+	if agent.GroveID != "" {
+		p.publish("grove."+agent.GroveID+".agent.status", evt)
+	}
+}
+
+// PublishAgentCreated publishes an agent created event to both agent-specific
+// and grove-scoped subjects (dual-publish pattern).
+func (p *ChannelEventPublisher) PublishAgentCreated(_ context.Context, agent *store.Agent) {
+	evt := AgentCreatedEvent{
+		AgentID:         agent.ID,
+		GroveID:         agent.GroveID,
+		Name:            agent.Name,
+		Slug:            agent.Slug,
+		Template:        agent.Template,
+		Phase:           agent.Phase,
+		Activity:        agent.Activity,
+		ContainerStatus: agent.ContainerStatus,
+		Image:           agent.Image,
+		Runtime:         agent.Runtime,
+		RuntimeBrokerID: agent.RuntimeBrokerID,
+		CreatedBy:       agent.CreatedBy,
+		Visibility:      agent.Visibility,
+		TaskSummary:     agent.TaskSummary,
+	}
+	if !agent.Created.IsZero() {
+		evt.Created = agent.Created.Format("2006-01-02T15:04:05Z07:00")
+	}
+	p.publish("agent."+agent.ID+".created", evt)
+	if agent.GroveID != "" {
+		p.publish("grove."+agent.GroveID+".agent.created", evt)
+	}
+}
+
+// PublishAgentDeleted publishes an agent deleted event to both agent-specific
+// and grove-scoped subjects (dual-publish pattern).
+func (p *ChannelEventPublisher) PublishAgentDeleted(_ context.Context, agentID, groveID string) {
+	evt := AgentDeletedEvent{
+		AgentID: agentID,
+		GroveID: groveID,
+	}
+	p.publish("agent."+agentID+".deleted", evt)
+	if groveID != "" {
+		p.publish("grove."+groveID+".agent.deleted", evt)
+	}
+}
+
+// PublishGroveCreated publishes a grove created event.
+func (p *ChannelEventPublisher) PublishGroveCreated(_ context.Context, grove *store.Grove) {
+	evt := GroveCreatedEvent{
+		GroveID: grove.ID,
+		Name:    grove.Name,
+		Slug:    grove.Slug,
+	}
+	p.publish("grove."+grove.ID+".created", evt)
+}
+
+// PublishGroveUpdated publishes a grove updated event.
+func (p *ChannelEventPublisher) PublishGroveUpdated(_ context.Context, grove *store.Grove) {
+	evt := GroveUpdatedEvent{
+		GroveID: grove.ID,
+		Name:    grove.Name,
+	}
+	p.publish("grove."+grove.ID+".updated", evt)
+}
+
+// PublishGroveDeleted publishes a grove deleted event.
+func (p *ChannelEventPublisher) PublishGroveDeleted(_ context.Context, groveID string) {
+	evt := GroveDeletedEvent{
+		GroveID: groveID,
+	}
+	p.publish("grove."+groveID+".deleted", evt)
+}
+
+// PublishBrokerConnected publishes broker connection events, one per grove the broker serves.
+func (p *ChannelEventPublisher) PublishBrokerConnected(_ context.Context, brokerID, brokerName string, groveIDs []string) {
+	for _, gid := range groveIDs {
+		evt := BrokerGroveEvent{
+			BrokerID:   brokerID,
+			BrokerName: brokerName,
+			GroveID:    gid,
+			Status:     "online",
+		}
+		p.publish("grove."+gid+".broker.status", evt)
+	}
+}
+
+// PublishBrokerDisconnected publishes broker disconnection events, one per grove the broker serves.
+func (p *ChannelEventPublisher) PublishBrokerDisconnected(_ context.Context, brokerID string, groveIDs []string) {
+	for _, gid := range groveIDs {
+		evt := BrokerGroveEvent{
+			BrokerID: brokerID,
+			GroveID:  gid,
+			Status:   "offline",
+		}
+		p.publish("grove."+gid+".broker.status", evt)
+	}
+}
+
+// PublishBrokerStatus publishes a general broker status event.
+func (p *ChannelEventPublisher) PublishBrokerStatus(_ context.Context, brokerID, status string) {
+	evt := BrokerStatusEvent{
+		BrokerID: brokerID,
+		Status:   status,
+	}
+	p.publish("broker."+brokerID+".status", evt)
+}
+
+// PublishNotification publishes a user notification event.
+func (p *ChannelEventPublisher) PublishNotification(_ context.Context, notif *store.Notification) {
+	evt := NotificationCreatedEvent{
+		ID:        notif.ID,
+		AgentID:   notif.AgentID,
+		GroveID:   notif.GroveID,
+		Status:    notif.Status,
+		Message:   notif.Message,
+		CreatedAt: notif.CreatedAt.Format("2006-01-02T15:04:05.000Z"),
+	}
+	p.publish("notification.created", evt)
+}
+
+// PublishUserMessage publishes a user.message event when an agent sends a message
+// to a human. The event is published to user-specific and grove-scoped subjects.
+func (p *ChannelEventPublisher) PublishUserMessage(_ context.Context, msg *store.Message) {
+	evt := UserMessageEvent{
+		ID:          msg.ID,
+		GroveID:     msg.GroveID,
+		Sender:      msg.Sender,
+		SenderID:    msg.SenderID,
+		Recipient:   msg.Recipient,
+		RecipientID: msg.RecipientID,
+		Msg:         msg.Msg,
+		Type:        msg.Type,
+		Urgent:      msg.Urgent,
+		AgentID:     msg.AgentID,
+		CreatedAt:   msg.CreatedAt.Format("2006-01-02T15:04:05.000Z"),
+	}
+	if msg.RecipientID != "" {
+		p.publish("user."+msg.RecipientID+".message", evt)
+	}
+	if msg.GroveID != "" {
+		p.publish("grove."+msg.GroveID+".user.message", evt)
+	}
+}
+
+// subjectMatchesPattern checks if a subject matches a NATS-style pattern.
+// '*' matches exactly one token, '>' matches one or more remaining tokens.
+// Tokens are dot-separated.
+func subjectMatchesPattern(pattern, subject string) bool {
+	patternParts := strings.Split(pattern, ".")
+	subjectParts := strings.Split(subject, ".")
+
+	for i, pp := range patternParts {
+		if pp == ">" {
+			// '>' matches one or more remaining tokens
+			return i < len(subjectParts)
+		}
+		if i >= len(subjectParts) {
+			return false
+		}
+		if pp == "*" {
+			continue
+		}
+		if pp != subjectParts[i] {
+			return false
+		}
+	}
+
+	return len(patternParts) == len(subjectParts)
+}

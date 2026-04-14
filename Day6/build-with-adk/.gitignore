@@ -1,0 +1,58 @@
+# Environment files
+.env
+.env.*
+!.env.example
+.mcp.json
+
+# Dot folders
+.adk/
+.claude/
+
+# Allow project-specific AI context folder (including nested .claude/, .cursor/, .github/)
+!retail-ai-location-strategy/.ai/
+!retail-ai-location-strategy/.ai/.claude/
+!retail-ai-location-strategy/.ai/.claude/**
+
+# Experiments folder (keep local only)
+experiments/
+
+# Docs folders (all .docs/ folders anywhere in the repo)
+.docs/
+
+# Generated artifacts
+equity_report.html
+chart_*.png
+infographic_*.png
+
+# Blog internal files
+retail-ai-location-strategy/blog/implementation_plan.md
+retail-ai-location-strategy/blog/assets/image-prompts.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js / Frontend
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+

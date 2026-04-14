@@ -1,0 +1,44 @@
+# scion ignore
+.scion/agents
+.scion/harness-configs
+# binaries
+/build/
+/.build/
+/scion
+scion-agent
+
+# secrets
+TEST_GEMINI_KEY
+
+# agent scratch space
+.scratch/
+
+# web frontend
+web/node_modules/
+web/dist/*
+!web/dist/client
+web/dist/client/*
+!web/dist/client/.gitkeep
+web/public/assets/
+web/public/shoelace/
+
+# docs site
+docs-site/node_modules/
+docs-site/dist/
+docs-site/.astro/
+docs-site/.env
+docs-site/.env.production
+web/.env
+web/.env.local
+web/.env.*.local
+web/coverage/
+*.log
+npm-debug.log*
+
+# IDE / OS (global)
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+pandas
+google-genai
+google-cloud-storage
+matplotlib
+seaborn

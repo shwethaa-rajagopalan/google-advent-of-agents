@@ -1,0 +1,4 @@
+google-adk
+asyncio
+typing
+google-genai
